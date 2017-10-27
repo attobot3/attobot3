@@ -51,9 +51,7 @@ function errorissue(repo, user, message, ctx)
             :body => message * "\ncc: @" * name(user)
         )
     )
-    error("""
-    Error when tagging: $(name(repo)) from user $(name(user)).
-    Problem: $message""")
+    return HTTP_OK
 end
 
 global CTX   = 0
@@ -70,7 +68,7 @@ function event_callback(event, ctx::AttoBotContext)
     global LAST_EVENT = event
     global CTX = ctx
 
-    SANITY_CHECKS = false
+    SANITY_CHECKS = true
     if event.kind == "release" && event.payload["action"] == "published"
         @show RELEASE   = event.payload["release"]
         @show REPO      = event.repository
@@ -78,18 +76,17 @@ function event_callback(event, ctx::AttoBotContext)
         @show package   = get(REPO.name)
         @show author    = RELEASE["author"]["login"]
         @show tag_name  = RELEASE["tag_name"]
-        @show tag_url  = RELEASE["html_url"]
+        @show tag_url   = RELEASE["html_url"]
         @show html_url  = get(REPO.html_url)
-
-        @show bot_repo = ctx.botuser * "/" * ctx.regname
-        package_first_letter = first(package)
+        @show bot_repo  = ctx.botuser * "/" * ctx.regname
+        @show package_first_letter = first(package)
 
         errorissue(msg) = errorissue(REPO, author, msg, ctx)
 
         if endswith(package, ".jl")
             package = package[1:end-3]
         else
-            SANITY_CHECKS && errorissue("The repository does not have a `.jl` suffix")
+            SANITY_CHECKS && return errorissue("The repository does not have a `.jl` suffix")
         end
 
         #=
@@ -131,7 +128,7 @@ function event_callback(event, ctx::AttoBotContext)
                            ))
 
         if isnull(REQUIRE_FILE.content)
-            errorissue("No `REQUIRE` file found in repo")
+            return errorissue("No `REQUIRE` file found in repo")
         end
 
         require_content = decode_file(REQUIRE_FILE)
@@ -241,7 +238,7 @@ function event_callback(event, ctx::AttoBotContext)
         end
 
         global THING = PR_REF
-        
+
         if existing
             PRS, page_data = GitHub.pull_requests(ctx.regrepo; auth = ctx.auth,
                                  params = Dict(
@@ -261,10 +258,8 @@ function event_callback(event, ctx::AttoBotContext)
             Repository: [$(name(REPO))]($html_url)
             Release: [$tag_name]($tag_url)
             cc: @$(author)
-            Please make sure that:
-
-            * CI passes for supported Julia versions (if applicable).
-            * Version bounds reflect minimum requirements.
+            
+            $TAG_REQ
             
             @$(author) This PR will remain open for 24 hours for feedback (which is optional). If you get feedback, please let us know if you are making changes, and we'll merge once you're done.
             """
