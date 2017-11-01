@@ -3,6 +3,7 @@ module AttoBot3
 import GitHub: GitHub, name
 import HTTP
 import Revise
+import JSON
 import SHA
 import Base.Random: UUID
 
@@ -38,13 +39,14 @@ const UUID_DNS = UUID(0x6ba7b810_9dad_11d1_80b4_00c04fd430c8)
 const UUID_JULIA = uuid5(UUID_DNS, "julialang.org")
 const UUID_PACKAGE = uuid5(UUID_JULIA, "package")
 
-const TAG_REQ = join((
-    "Please make sure that:",
-    "- CI passes for supported Julia versions (if applicable).",
-    "- Version bounds reflect minimum requirements."
-    ), '\n')
+const TAG_REQ = """
+    Please make sure that:,
+    - CI passes for supported Julia versions (if applicable).,
+    - Version bounds reflect minimum requirements.
 
-function errorissue(repo, user, message, ctx)
+    """
+
+function _errorissue(repo, user, message, ctx)
     GitHub.create_issue(repo, auth = ctx.auth,
         params = Dict(
             :title => "Error tagging new release",
@@ -59,7 +61,7 @@ global THING = 0
 global LAST_EVENT = 0
 
 function decode_file(file::GitHub.Content)
-    @assert get(file.encoding) == "base64"
+    @assert get(file.encoding) == "base64" # GitHub says this will always be the case
     str = String(Base.base64decode(get(file.content)))
     return replace(str, "\r\n", "\n")
 end
@@ -68,20 +70,48 @@ function event_callback(event, ctx::AttoBotContext)
     global LAST_EVENT = event
     global CTX = ctx
 
-    SANITY_CHECKS = true
+    SANITY_CHECKS = false
+
+    if event.kind == "pull_request" && event.payload["action"] == "closed"
+
+        repo = event.repository
+        @show name(repo) == ctx.regrepo
+        if name(repo) != ctx.regrepo
+            return HTTP_OK
+        end
+
+        PR = GitHub.PullRequest(event.payload["pull_request"])
+        @show (get(PR.user).login) == ctx.botuser
+        if get(get(PR.user).login) != ctx.botuser
+            return HTTP_OK
+        end
+
+        @show isnull(PR.merged_at)
+        if isnull(PR.merged_at)
+            sleep(25)
+            PR2 = GitHub.pull_request(ctx.regrepo, PR)
+            # Branch got reopened
+            if get(PR2.state) != "closed"
+                return HTTP_OK
+            end
+        end
+
+        branch = get(get(PR.head).ref)
+        GitHub.delete_reference(ctx.botuser * "/" * ctx.regname, "heads/$branch"; auth = ctx.auth)
+    end
+
     if event.kind == "release" && event.payload["action"] == "published"
-        @show RELEASE   = event.payload["release"]
-        @show REPO      = event.repository
+        RELEASE   = event.payload["release"]
+        REPO      = event.repository
+        package   = get(REPO.name)
+        author    = RELEASE["author"]["login"]
+        tag_name  = RELEASE["tag_name"]
+        tag_url   = RELEASE["html_url"]
+        html_url  = get(REPO.html_url)
+        bot_repo  = ctx.botuser * "/" * ctx.regname
+        package_first_letter = uppercase(first(package))
 
-        @show package   = get(REPO.name)
-        @show author    = RELEASE["author"]["login"]
-        @show tag_name  = RELEASE["tag_name"]
-        @show tag_url   = RELEASE["html_url"]
-        @show html_url  = get(REPO.html_url)
-        @show bot_repo  = ctx.botuser * "/" * ctx.regname
-        @show package_first_letter = first(package)
-
-        errorissue(msg) = errorissue(REPO, author, msg, ctx)
+        errorissue(msg) = _errorissue(REPO, author, msg, ctx)
 
         if endswith(package, ".jl")
             package = package[1:end-3]
@@ -91,28 +121,58 @@ function event_callback(event, ctx::AttoBotContext)
 
         #=
         TODO: Errror check on SEMVER
-        if (v isa Void) || (TAG_NAME[1] != 'v')
-            errorissue("The tag name `$TAG_NAME` is not of the appropriate SemVer form (vX.Y.Z).")
+        if (v isa Void) || (tag_name[1] != 'v')
+            errorissue("The tag name `$tag_name` is not of the appropriate SemVer form (vX.Y.Z).")
         end
         =#
 
-        # All packages should have a `versions.toml`
-        VERSIONS_FILE = GitHub.file(ctx.regrepo, "$package_first_letter/$package/versions.toml";
+        # All packages should have a `package.toml`
+        REGISTRY_PACKAGE_FILE = GitHub.file(ctx.regrepo, "$package_first_letter/$package/package.toml";
                                         handle_error = false, auth = ctx.auth,
                                         params = Dict(
                                             "ref" => ctx.regbranch
                                         ))
 
-        # TODO: Check that URL corresponds to the registered package URL
 
-        if isnull(VERSIONS_FILE.content)
+        if isnull(REGISTRY_PACKAGE_FILE.content)
             register = true
         else
             register = false
-            # verify url
+
+            # Verify that the tag came from the repo that is registered in the registry
+            registry_package_toml = Pkg3.TOML.parse(decode_file(REGISTRY_PACKAGE_FILE))
+            registered_package_url = registry_package_toml["repo"]
+
+            if !(html_url in registered_package_url) # Pkg3 seems to only use https
+                return errorissue("The repo this package was registered from ($html_url) does not correspond to the one found in the registry: ($registered_package_url)")
+            end
+
+
+            VERSIONS_FILE = GitHub.file(REPO, "$package_first_letter/$package/versions.toml", auth = ctx.auth,
+                                params = Dict(
+                                    "ref" => ctx.regbranch
+                                ))
+
+            versions_toml = Pkg3.TOML.parse(decode_file(VERSIONS_FILE))
+            versions = sort(VersionInfo.(collect(keys(versions_toml))))
+            #=
+            if v in versions
+                return errorissue("The version $v is already registered.")
+            end
+
+            earlier_version = last(searchsorted(versions, v))
+
+            if last(closest_version) == 0
+                return errorissue("Cannot tag a new version, $tag_name preceding all existing versions.")
+            end
+            =#
+
+            # Need to generate the new compatability here...
+
+            # TODO find reqs for that versio
         end
 
-        @show register
+
 
         # 2) get the commit hash corresponding to the tag
         TAG_REF = GitHub.reference(REPO, "tags/" * tag_name; auth = ctx.auth)
@@ -143,12 +203,12 @@ function event_callback(event, ctx::AttoBotContext)
         PREV_TREE = GitHub.tree(ctx.regrepo, get(PREV_COMMIT.sha), auth = ctx.auth)
         global THING = PREV_TREE
 
-         # 6a) create blob for REQUIRE
-         REQUIRE_BLOB = GitHub.create_blob(ctx.botuser * "/" * ctx.regname; auth = ctx.auth,
-                            params = Dict(
-                                "encoding" => "utf-8",
-                                "content"  => require_content
-                            ))
+        # 6a) create blob for REQUIRE
+        REQUIRE_BLOB = GitHub.create_blob(ctx.botuser * "/" * ctx.regname; auth = ctx.auth,
+                           params = Dict(
+                               "encoding" => "utf-8",
+                               "content"  => require_content
+                           ))
 
         if register
             package_content = """
@@ -162,7 +222,7 @@ function event_callback(event, ctx::AttoBotContext)
                             "content"  => package_content
                         ))
         end
-        
+
 
         tree_data = Dict(
                        "base_tree" => get(PREV_TREE.sha),
@@ -186,7 +246,7 @@ function event_callback(event, ctx::AttoBotContext)
 
         NEW_TREE = GitHub.create_tree(bot_repo; auth = ctx.auth,
                        params = tree_data)
-        
+
         # Get user name and email
         AUTHOR = GitHub.owner(author; handle_error = false, auth = ctx.auth)
         author_name = isnull(AUTHOR.name) ? author : get(AUTHOR.name)
@@ -225,7 +285,7 @@ function event_callback(event, ctx::AttoBotContext)
                             "sha" => get(COMMIT.sha)
                    ))
         existing = false
-        
+
         # Branch already exists
         if isnull(PR_REF.object)
             info("Force pushing to $new_branch_name with sha $(get(COMMIT.sha))")
@@ -239,7 +299,23 @@ function event_callback(event, ctx::AttoBotContext)
 
         global THING = PR_REF
 
+        # Temp set a repo name here to test
+        travis_pr_line = ""
+        r = HTTP.get("https://api.travis-ci.org/repos/$(ctx.regrepo)/branches/$tag_name"; statusraise = false)
+        if r.status == 200 # check
+            rj = JSON.parse(String(r))
+            build_id = string(rj["branch"]["id"])
+            if get(TAG_REF) == rj["commit"]["sha"]
+                badge_url = "https://api.travis-ci.org/$(ctx.regrepo).svg?branch=$tag_name"
+                build_url = "https://travis-ci.org/$(ctx.regrepo)/builds/build_id"
+                travis_pr_line = "Travis: [![Travis Build Status]($badge_url)]($build_url)\n"
+            end
+        end
+
+        # Branch already exists on the bot repo which means that a PR is currently in progress.
+        # Update that PR instead
         if existing
+
             PRS, page_data = GitHub.pull_requests(ctx.regrepo; auth = ctx.auth,
                                  params = Dict(
                                      "head" => ctx.botuser * ":" * new_branch_name,
@@ -251,26 +327,46 @@ function event_callback(event, ctx::AttoBotContext)
                 params = Dict(
                     "body" => "comment..."
                 ))
+
+        # Create a new PR
         else
-            # Create the PR
-            title = "Register new package " * package * " " * tag_name
             body = """
             Repository: [$(name(REPO))]($html_url)
             Release: [$tag_name]($tag_url)
-            cc: @$(author)
-            
-            $TAG_REQ
-            
-            @$(author) This PR will remain open for 24 hours for feedback (which is optional). If you get feedback, please let us know if you are making changes, and we'll merge once you're done.
+
             """
 
-            PR = GitHub.create_pull_request(ctx.regrepo; auth = ctx.auth,
-                params = Dict(
-                        "title" => title,
-                        "body" => body,
-                        "head" => ctx.botuser * ":" * new_branch_name,
-                        "base" => ctx.regbranch
-                       ))
+            body *= travis_pr_line
+                # Package has not been registered before
+            if register
+
+            else
+                body *= "Diff link"
+                body *= "Diff require"
+            end
+
+            title = (register ? "Register" : "Tag") * " $package $tag_name"
+
+            # Create the PR
+            body *= """
+            cc: @$(author)
+
+            $TAG_REQ
+            """
+
+            if register
+                body *= """
+                    @$(author) This PR will remain open for 24 hours for feedback (which is optional). If you get feedback, please let us know if you are making changes, and we'll merge once you're done.
+                """
+
+                PR = GitHub.create_pull_request(ctx.regrepo; auth = ctx.auth,
+                    params = Dict(
+                            "title" => title,
+                            "body" => body,
+                            "head" => ctx.botuser * ":" * new_branch_name,
+                            "base" => ctx.regbranch
+                           ))
+            end
         end
     end
     return HTTP_OK
@@ -288,7 +384,7 @@ function run_server()
 
     HOST = IPv4(HOST_STR)
     PORT = parse(Int, PORT_STR)
-    
+
     if !haskey(ENV, "ATTOBOT_AUTH")
         error("The environment variable `ATTOBOT_AUTH` needs to exist and be a token that have write access to the GitHub user $BOT_USER")
     end
